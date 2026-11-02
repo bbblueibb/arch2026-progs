@@ -1,418 +1,229 @@
 #include "rubik.h"
-#include "rubik_hw1_tables.h"
 
-enum {
-    CUBIES = 7,
-    PERMUTATIONS = 5040,
-    ORIENTATIONS = 729,
-    STATES = PERMUTATIONS * ORIENTATIONS,
-    MOVES = 9,
-    MAX_DEPTH = 11,
+#include "rubik_search_tables.h"
 
-    PATTERN_CUBIES = 4,
-    PATTERN_POSITIONS = 840,
-    PATTERN_ORIENTATIONS = 81,
-    PATTERN_STATES = PATTERN_POSITIONS * PATTERN_ORIENTATIONS
+/* Rank, move, and face conventions follow the HW1 cube model.
+ * Move order: R R2 R' B B2 B' D D2 D'.
+ * Search strategy: a five-move suffix table and an exact-distance-eleven table,
+ * following the approach of weiso131/minirubik. Transition tables avoid
+ * reconstructing and ranking a complete cube at every search node.
+ */
+static const uint16_t *const rb_perm_face[3] = {
+    rb_perm_next, rb_perm_next + 5040, rb_perm_next + 10080};
+static const uint16_t *const rb_ori_face[3] = {rb_ori_next, rb_ori_next + 729,
+                                               rb_ori_next + 1458};
+static const uint8_t rb_face[9] = {0, 0, 0, 1, 1, 1, 2, 2, 2};
+static const uint8_t rb_turns[9] = {1, 2, 3, 1, 2, 3, 1, 2, 3};
+static const char *const rb_names[9] = {"R",  "R2", "R'", "B", "B2",
+                                        "B'", "D",  "D2", "D'"};
+
+struct rb_frame {
+    uint16_t p, o;
+    uint16_t child_p, child_o;
+    uint32_t next_move, previous_face;
 };
 
-typedef struct {
-    uint8_t p[CUBIES], o[CUBIES];
-} state_t;
-
-typedef struct {
-    uint8_t position[PATTERN_CUBIES];
-    uint8_t orientation[PATTERN_CUBIES];
-} pattern_state_t;
-
-typedef struct {
-    uint16_t p;
-    uint16_t o;
-    pattern_state_t pattern;
-
-    int8_t previous_face;
-    uint8_t next_move;
-} search_frame_t;
-
-static uint8_t ida_path[MAX_DEPTH];
-static uint8_t ida_solution_length;
-
-static search_frame_t ida_stack[MAX_DEPTH + 1];
-
-static uint16_t permutation_next(uint8_t face, uint16_t p)
+/* A valid permutation fills every entry before it is ranked. */
+static int rb_parse(const char *state, uint16_t *p_out, uint16_t *o_out)
 {
-    return permutation_transition[(uint32_t) face * PERMUTATIONS + p];
-}
-
-static uint16_t orientation_next(uint8_t face, uint16_t o)
-{
-    return orientation_transition[(uint32_t) face * ORIENTATIONS + o];
-}
-
-static const char *const move_names[MOVES] = {"R",  "R2", "R'", "B", "B2",
-                                              "B'", "D",  "D2", "D'"};
-
-/* For each old position, give its destination after one quarter turn. */
-static const uint8_t destination_of[3][CUBIES] = {
-    {3, 0, 2, 4, 1, 5, 6},
-    {0, 1, 2, 6, 3, 4, 5},
-    {0, 4, 1, 3, 5, 2, 6},
-};
-
-static const uint8_t twist[3][CUBIES] = {
-    {1, 2, 0, 2, 1, 0, 0},
-    {0, 0, 0, 1, 2, 1, 2},
-    {0, 0, 0, 0, 0, 0, 0},
-};
-
-/* The three quarter-turns preserve the fixed front-upper-left corner. */
-
-static uint16_t rank_permutation(const state_t *state)
-{
-    uint16_t p = 0;
-
-    for (uint8_t i = 0; i < CUBIES; ++i) {
-        uint8_t smaller = 0;
-
-        for (uint8_t j = (uint8_t) (i + 1U); j < CUBIES; ++j) {
-            if (state->p[j] < state->p[i])
-                ++smaller;
-        }
-
-        uint16_t scaled;
-
-        switch (i) {
-        case 0:
-            scaled = (uint16_t) ((p << 3) - p); /* p * 7 */
-            break;
-        case 1:
-            scaled = (uint16_t) ((p << 2) + (p << 1)); /* p * 6 */
-            break;
-        case 2:
-            scaled = (uint16_t) ((p << 2) + p); /* p * 5 */
-            break;
-        case 3:
-            scaled = (uint16_t) (p << 2); /* p * 4 */
-            break;
-        case 4:
-            scaled = (uint16_t) ((p << 1) + p); /* p * 3 */
-            break;
-        case 5:
-            scaled = (uint16_t) (p << 1); /* p * 2 */
-            break;
-        default:
-            scaled = p; /* p * 1 */
-            break;
-        }
-
-        p = (uint16_t) (scaled + smaller);
+    uint8_t permutation[7];
+    uint32_t seen = 0, sum = 0, orientation = 0;
+    for (unsigned i = 0; i < 7; ++i) {
+        unsigned value = (unsigned char) state[i] - (unsigned) '1';
+        if (value >= 7 || (seen & (1u << value)))
+            return 0;
+        seen |= 1u << value;
+        permutation[i] = (uint8_t) value;
     }
-
-    return p;
-}
-
-static uint16_t rank_orientation(const state_t *state)
-{
-    uint16_t o = 0;
-
-    for (uint8_t i = 0; i < 6; ++i)
-        o = (uint16_t) (o * 3U + state->o[i]);
-
-    return o;
-}
-
-static uint32_t rank_4corner_components(
-    const uint8_t position[PATTERN_CUBIES],
-    const uint8_t orientation[PATTERN_CUBIES])
-{
-    uint8_t p0 = position[0];
-    uint8_t p1 = position[1];
-    uint8_t p2 = position[2];
-    uint8_t p3 = position[3];
-
-    uint8_t q0 = p0;
-
-    uint8_t q1 = (uint8_t) (p1 - (p0 < p1));
-
-    uint8_t q2 = (uint8_t) (p2 - (p0 < p2) - (p1 < p2));
-
-    uint8_t q3 = (uint8_t) (p3 - (p0 < p3) - (p1 < p3) - (p2 < p3));
-
-    uint16_t position_rank =
-        (uint16_t) ((((q0 * 6U) + q1) * 5U + q2) * 4U + q3);
-
-    uint8_t orientation_rank =
-        (uint8_t) (((orientation[0] * 3U + orientation[1]) * 3U +
-                    orientation[2]) *
-                       3U +
-                   orientation[3]);
-
-    return (uint32_t) position_rank * PATTERN_ORIENTATIONS + orientation_rank;
-}
-
-static pattern_state_t extract_4corner_pattern(const state_t *state)
-{
-    pattern_state_t pattern = {0};
-
-    for (uint8_t pos = 0; pos < CUBIES; ++pos) {
-        uint8_t cubie = state->p[pos];
-
-        if (cubie < PATTERN_CUBIES) {
-            pattern.position[cubie] = pos;
-            pattern.orientation[cubie] = state->o[pos];
-        }
+    for (unsigned i = 0; i < 7; ++i) {
+        unsigned value = (unsigned char) state[i + 7] - (unsigned) '1';
+        if (value >= 3)
+            return 0;
+        sum += value;
+        if (i < 6)
+            orientation = orientation + (orientation << 1) + value;
     }
-
-    return pattern;
-}
-
-static pattern_state_t quarter_turn_pattern(pattern_state_t pattern,
-                                            uint8_t face)
-{
-    pattern_state_t result;
-
-    for (uint8_t cubie = 0; cubie < PATTERN_CUBIES; ++cubie) {
-        uint8_t old_position = pattern.position[cubie];
-
-        uint8_t destination = destination_of[face][old_position];
-
-        result.position[cubie] = destination;
-
-        uint8_t new_orientation =
-            (uint8_t) (pattern.orientation[cubie] + twist[face][destination]);
-
-        if (new_orientation >= 3U)
-            new_orientation = (uint8_t) (new_orientation - 3U);
-
-        result.orientation[cubie] = new_orientation;
-    }
-
-    return result;
-}
-
-static uint8_t heuristic(uint16_t p, uint16_t o, const pattern_state_t *pattern)
-{
-    uint8_t hp = permutation_pdb[p];
-    uint8_t ho = orientation_pdb[o];
-
-    uint32_t pattern_rank =
-        rank_4corner_components(pattern->position, pattern->orientation);
-
-    uint8_t hc = corner4_pdb[pattern_rank];
-
-    uint8_t h = hp > ho ? hp : ho;
-
-    return h > hc ? h : hc;
-}
-
-static int ida_dfs_iterative(uint16_t p,
-                             uint16_t o,
-                             pattern_state_t pattern,
-                             uint8_t bound)
-{
-    int top = 0;
-
-    ida_stack[0].p = p;
-    ida_stack[0].o = o;
-    ida_stack[0].pattern = pattern;
-    ida_stack[0].previous_face = -1;
-    ida_stack[0].next_move = 0;
-
-    uint8_t h = heuristic(p, o, &pattern);
-
-    if (h > bound) {
+    if (state[14] != '\0')
         return 0;
+    while (sum >= 3)
+        sum -= 3;
+    if (sum != 0)
+        return 0;
+
+    uint32_t rank = 0;
+    for (unsigned i = 0; i < 6; ++i) {
+        uint32_t smaller = 0;
+        for (unsigned j = i + 1; j < 7; ++j)
+            smaller += permutation[j] < permutation[i];
+        rank = rank * (7u - i) + smaller;
     }
-
-    if (p == 0 && o == 0) {
-        ida_solution_length = 0;
-        return 1;
-    }
-
-    while (top >= 0) {
-        search_frame_t *frame = &ida_stack[top];
-
-        /*
-         * All children of this node have been explored.
-         * Return to the parent.
-         */
-        if (frame->next_move >= MOVES) {
-            --top;
-            continue;
-        }
-
-        /*
-         * Remember the next move before descending.
-         * This replaces the return state normally kept
-         * by recursive function calls.
-         */
-        uint8_t move = frame->next_move++;
-
-        uint8_t face;
-        uint8_t turns;
-
-        if (move < 3) {
-            face = 0;
-            turns = (uint8_t) (move + 1U);
-        } else if (move < 6) {
-            face = 1;
-            turns = (uint8_t) (move - 2U);
-        } else {
-            face = 2;
-            turns = (uint8_t) (move - 5U);
-        }
-
-        /*
-         * Consecutive moves on the same face are redundant.
-         */
-        if ((int8_t) face == frame->previous_face)
-            continue;
-
-        uint16_t next_p = frame->p;
-        uint16_t next_o = frame->o;
-        pattern_state_t next_pattern = frame->pattern;
-
-        /*
-         * move = R/R2/R', B/B2/B', or D/D2/D'.
-         * The transition tables contain quarter turns,
-         * so apply them one, two, or three times.
-         */
-        for (uint8_t turn = 0; turn < turns; ++turn) {
-            next_p = permutation_next(face, next_p);
-            next_o = orientation_next(face, next_o);
-            next_pattern = quarter_turn_pattern(next_pattern, face);
-        }
-
-        uint8_t depth = (uint8_t) (top + 1);
-
-        h = heuristic(next_p, next_o, &next_pattern);
-
-        if ((uint8_t) (depth + h) > bound) {
-            continue;
-        }
-
-        ida_path[top] = move;
-
-        if (next_p == 0 && next_o == 0) {
-            ida_solution_length = depth;
-            return 1;
-        }
-
-        /*
-         * An unsolved state at the current bound cannot
-         * produce another child within this iteration.
-         */
-        if (depth == bound)
-            continue;
-
-        /*
-         * Push the child onto the explicit stack.
-         */
-        ++top;
-
-        ida_stack[top].p = next_p;
-        ida_stack[top].o = next_o;
-        ida_stack[top].pattern = next_pattern;
-        ida_stack[top].previous_face = (int8_t) face;
-        ida_stack[top].next_move = 0;
-    }
-
-    return 0;
+    *p_out = (uint16_t) rank;
+    *o_out = (uint16_t) orientation;
+    return 1;
 }
 
-static int solve_ida(const state_t *state)
+/* 729 = 9*9*9. The shift/add chain avoids a hot multiply helper. */
+static uint32_t rb_rank(uint16_t p, uint16_t o)
 {
-    uint16_t p = rank_permutation(state);
-    uint16_t o = rank_orientation(state);
-
-    pattern_state_t pattern = extract_4corner_pattern(state);
-
-    uint8_t bound = heuristic(p, o, &pattern);
-
-    while (bound <= MAX_DEPTH) {
-        if (ida_dfs_iterative(p, o, pattern, bound)) {
-            return 1;
-        }
-
-        ++bound;
-    }
-
-    return 0;
+    uint32_t value = p;
+    value += value << 3;
+    value += value << 3;
+    return value + (value << 3) + o;
 }
 
-static int valid(const state_t *state)
+/* Each sorted entry is (rank << 4) | move. Compare against rank << 4,
+ * so a binary-search iteration does not need to unpack the stored rank.
+ * Move 15 is used only by the solved entry, which needs no move.
+ */
+static int rb_lookup(const uint32_t *table, uint32_t count, uint32_t rank)
 {
-    uint8_t sum = 0;
-
-    for (uint8_t i = 0; i < CUBIES; ++i) {
-        if (state->p[i] >= CUBIES || state->o[i] >= 3)
-            return 0;
-
-        for (uint8_t j = 0; j < i; ++j)
-            if (state->p[j] == state->p[i])
-                return 0;
-        sum = (uint8_t) (sum + state->o[i]);
-    }
-    while (sum >= 3U)
-        sum = (uint8_t) (sum - 3U);
-
-    return sum == 0;
-}
-
-static int parse_state(const char *input, state_t *state)
-{
-    for (int i = 0; i < 14; ++i) {
-        int limit = i < 7 ? 7 : 3;
-        if (input[i] < '1' || input[i] > '0' + limit)
-            return 0;
-
-        uint8_t value = (uint8_t) (input[i] - '1');
-
-        if (i < 7)
-            state->p[i] = value;
+    uint32_t key = rank << 4;
+    uint32_t lo = 0, hi = count;
+    while (lo < hi) {
+        uint32_t mid = (lo + hi) >> 1;
+        if (table[mid] < key)
+            lo = mid + 1;
         else
-            state->o[i - 7] = value;
+            hi = mid;
     }
-    return input[14] == '\0' && valid(state);
+    if (lo < count && (table[lo] >> 4) == rank)
+        return (int) (table[lo] & 15u);
+    return -1;
 }
 
-/* Return the optimal move count and write bounded, NUL-terminated move text. */
+static void rb_apply(uint16_t *p, uint16_t *o, unsigned move)
+{
+    const uint16_t *pt = rb_perm_face[rb_face[move]];
+    const uint16_t *ot = rb_ori_face[rb_face[move]];
+    for (unsigned turn = 0; turn < rb_turns[move]; ++turn) {
+        *p = pt[*p];
+        *o = ot[*o];
+    }
+}
+
+/* At most five prefix moves and six frames. A parent's child rank is retained
+ * while descending, so R, R2, R' reuse successive quarter-turn lookups.
+ */
+static int rb_prefix(uint16_t *p,
+                     uint16_t *o,
+                     unsigned previous_face,
+                     uint8_t *path,
+                     unsigned *length)
+{
+    struct rb_frame stack[6];
+    uint16_t root_p = *p, root_o = *o;
+    unsigned offset = *length;
+    for (unsigned bound = 1; bound <= 5; ++bound) {
+        int top = 0;
+        stack[0].p = root_p;
+        stack[0].o = root_o;
+        stack[0].child_p = root_p;
+        stack[0].child_o = root_o;
+        stack[0].next_move = 0;
+        stack[0].previous_face = previous_face;
+        while (top >= 0) {
+            struct rb_frame *frame = &stack[top];
+            if (frame->next_move >= 9) {
+                --top;
+                continue;
+            }
+            unsigned move = frame->next_move++;
+            unsigned face = rb_face[move];
+            if (face == frame->previous_face)
+                continue;
+            if (move == 0 || move == 3 || move == 6) {
+                frame->child_p = frame->p;
+                frame->child_o = frame->o;
+            }
+            frame->child_p = rb_perm_face[face][frame->child_p];
+            frame->child_o = rb_ori_face[face][frame->child_o];
+            path[offset + (unsigned) top] = (uint8_t) move;
+            if ((unsigned) top + 1 == bound) {
+                int next = rb_lookup(rb_near, RB_NEAR_COUNT,
+                                     rb_rank(frame->child_p, frame->child_o));
+                if (next >= 0) {
+                    *p = frame->child_p;
+                    *o = frame->child_o;
+                    *length = offset + bound;
+                    return next;
+                }
+            } else {
+                struct rb_frame *child = &stack[top + 1];
+                child->p = frame->child_p;
+                child->o = frame->child_o;
+                child->child_p = frame->child_p;
+                child->child_o = frame->child_o;
+                child->next_move = 0;
+                child->previous_face = face;
+                ++top;
+            }
+        }
+    }
+    return -1;
+}
+
 int rubik_solve(const char *state, char *out, size_t cap)
 {
-    state_t cube;
-
-    /* Invalid input takes precedence and never modifies the output buffer. */
-    if (!parse_state(state, &cube))
+    uint16_t p = 0, o = 0;
+    if (!rb_parse(state, &p, &o))
         return -1;
-
-    /* Even an empty solution needs one byte for its terminating NUL. */
     if (cap == 0)
         return -2;
-
-    if (!solve_ida(&cube))
-        return -1;
-
-    size_t needed = 1;
-    for (uint8_t i = 0; i < ida_solution_length; ++i) {
-        const char *name = move_names[ida_path[i]];
-        if (i != 0)
-            ++needed;
-        needed += name[1] == '\0' ? 1u : 2u;
+    if (p == 0 && o == 0) {
+        out[0] = '\0';
+        return 0;
     }
-
-    if (needed > cap) {
+    if (cap == 1) {
         out[0] = '\0';
         return -2;
     }
 
+    uint8_t path[11];
+    unsigned length = 0;
+    int next = rb_lookup(rb_near, RB_NEAR_COUNT, rb_rank(p, o));
+    if (next < 0) {
+        unsigned previous_face = 3;
+        int first = rb_lookup(rb_far, RB_FAR_COUNT, rb_rank(p, o));
+        if (first >= 0) {
+            if (first >= 9)
+                return -1;
+            path[length++] = (uint8_t) first;
+            previous_face = rb_face[first];
+            rb_apply(&p, &o, (unsigned) first);
+        }
+        next = rb_prefix(&p, &o, previous_face, path, &length);
+        if (next < 0)
+            return -1;
+    }
+
+    while (p != 0 || o != 0) {
+        if (next < 0 || next >= 9 || length >= 11)
+            return -1;
+        path[length++] = (uint8_t) next;
+        rb_apply(&p, &o, (unsigned) next);
+        if (p != 0 || o != 0)
+            next = rb_lookup(rb_near, RB_NEAR_COUNT, rb_rank(p, o));
+    }
+
+    size_t needed = 1;
+    for (unsigned i = 0; i < length; ++i) {
+        if (i != 0)
+            ++needed;
+        needed += rb_names[path[i]][1] == '\0' ? 1u : 2u;
+    }
+    if (needed > cap) {
+        out[0] = '\0';
+        return -2;
+    }
     char *dest = out;
-    for (uint8_t i = 0; i < ida_solution_length; ++i) {
-        const char *name = move_names[ida_path[i]];
+    for (unsigned i = 0; i < length; ++i) {
         if (i != 0)
             *dest++ = ' ';
+        const char *name = rb_names[path[i]];
         *dest++ = name[0];
         if (name[1] != '\0')
             *dest++ = name[1];
     }
     *dest = '\0';
-    return ida_solution_length;
+    return (int) length;
 }
